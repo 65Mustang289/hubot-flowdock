@@ -1,4 +1,5 @@
 flowdock = require 'flowdock'
+
 try
   {Adapter,TextMessage} = require 'hubot'
 catch
@@ -94,73 +95,104 @@ class Flowdock extends Adapter
 
   reconnect: (reason) ->
     @robot.logger.info("Reconnecting: #{reason}")
-    @stream.end()
-    @stream.removeAllListeners()
+    for i in [0..@streams.length-1]
+      @streams[i].end()
+      @streams[i].removeAllListeners()
     @fetchFlowsAndConnect()
 
   connect: ->
     ids = (flow.id for flow in @joinedFlows())
+
+    maxFlowsPerStream = parseInt( process.env.HUBOT_FLOWDOCK_FLOWS_PER_STREAM, 10 ) || 325
+    flowChunks = new Array()
+    if ids.length > maxFlowsPerStream
+      lower = 0
+      while lower < ids.length
+        flowChunks.push(ids.slice(lower, lower+maxFlowsPerStream))
+        if lower+maxFlowsPerStream < ids.length
+          lower = lower+maxFlowsPerStream
+        else
+          lower = ids.length
+    else
+      flowChunks.push(ids)
+
+    connectedFlowCount = 0
+    @streams = []
+
     @robot.logger.info('Flowdock: connecting')
-    @stream = @bot.stream(ids, active: 'idle', user: 1)
-    @stream.on 'connected', =>
-      @robot.logger.info('Flowdock: connected and streaming')
-      @robot.logger.info('Flowdock: listening to flows:', (flow.name for flow in @joinedFlows()).join(', '))
-    @stream.on 'clientError', (error) => @robot.logger.error('Flowdock: client error:', error)
-    @stream.on 'disconnected', => @robot.logger.info('Flowdock: disconnected')
-    @stream.on 'reconnecting', => @robot.logger.info('Flowdock: reconnecting')
-    @stream.on 'message', (message) =>
-      return if !message.content? || !message.event?
-      if @needsReconnect(message)
-        @reconnect('Reloading flow list')
-      if (@myId(message.user) && message.event in ['backend.user.join', 'flow-add'])
-        @robot.emit "flow-add", { id: message.content.id, name: message.content.name }
-      if message.event == 'user-edit' || message.event == 'backend.user.join'
-        @changeUserNick(message.content.user.id, message.content.user.nick)
-      return unless message.event in ['message', 'comment']
-      return if !message.id?
-      return if @myId(message.user)
-      return if String(message.user) in @ignores
-
-      @robot.logger.debug 'Received message', message
-
-      author = @userFromId(message.user)
-
-      thread_id = message.thread_id
-      messageId = if thread_id?
-        undefined
-      else if message.event == 'message'
-        message.id
+    for j in [0..flowChunks.length-1]
+      @robot.logger.debug('Flowdock: stream ' + (j+1) + ' connecting to ' + flowChunks[j])
+      if j == 0
+        @streams[j] = @bot.stream(flowChunks[j], active: 'idle', user: 1)
       else
-        # For comments the parent message id is embedded in an 'influx' tag
-        if message.tags
-          influxTag = do ->
-            for tag in message.tags
-              return tag if /^influx:/.test tag
-          (influxTag.split ':', 2)[1] if influxTag
+        @streams[j] = @bot.stream(flowChunks[j], active: 'idle')
 
-      msg = if message.event == 'comment' then message.content.text else message.content
+    for i in [0..flowChunks.length-1]
+      @streams[i].on 'connected', =>
+        connectedFlowCount += 1
+        @robot.logger.info('Flowdock: connected and streaming stream-' + connectedFlowCount)
+        if connectedFlowCount == flowChunks.length
+          @robot.logger.info('Flowdock: listening to flows:', (flow.name for flow in @joinedFlows()).join(', '))
+      @streams[i].on 'clientError', (error) => @robot.logger.error('Flowdock: client error:', error)
+      @streams[i].on 'disconnected', =>
+        @robot.logger.info('Flowdock: disconnected stream-' + connectedFlowCount)
+        connectedFlowCount -= 1
+        if connectedFlowCount == 0
+          @robot.logger.info('Flowdock: all streams disconnected')
+      @streams[i].on 'reconnecting', => @robot.logger.info('Flowdock: reconnecting')
+      @streams[i].on 'message', (message) =>
+        return if !message.content? || !message.event?
+        if @needsReconnect(message)
+          @reconnect('Reloading flow list')
+        if (@myId(message.user) && message.event in ['backend.user.join', 'flow-add'])
+          @robot.emit "flow-add", { id: message.content.id, name: message.content.name }
+        if message.event == 'user-edit' || message.event == 'backend.user.join'
+          @changeUserNick(message.content.user.id, message.content.user.nick)
+        return unless message.event in ['message', 'comment']
+        return if !message.id?
+        return if @myId(message.user)
+        return if String(message.user) in @ignores
 
-      # Reformat leading @mention name to be like "name: message" which is
-      # what hubot expects. Add bot name with private messages if not already given.
-      botPrefix = "#{@robot.name}: "
-      regex = new RegExp("^@#{@bot.userName}(,|\\b)", "i")
-      hubotMsg = msg.replace(regex, botPrefix)
-      if !message.flow && !hubotMsg.match(new RegExp("^#{@robot.name}", "i"))
-        hubotMsg = botPrefix + hubotMsg
+        @robot.logger.debug 'Received message', message
 
-      author.room = message.flow # Many scripts expect author.room to be available
-      author.flow = message.flow # For backward compatibility
+        author = @userFromId(message.user)
 
-      metadata =
-        room: message.flow
-      metadata['thread_id'] = thread_id if thread_id?
-      metadata['message_id'] = messageId if messageId?
+        thread_id = message.thread_id
+        messageId = if thread_id?
+          undefined
+        else if message.event == 'message'
+          message.id
+        else
+          # For comments the parent message id is embedded in an 'influx' tag
+          if message.tags
+            influxTag = do ->
+              for tag in message.tags
+                return tag if /^influx:/.test tag
+            (influxTag.split ':', 2)[1] if influxTag
 
-      messageObj = new TextMessage(author, hubotMsg, message.id, metadata)
-      # Support metadata even if hubot does not currently do that
-      messageObj.metadata = metadata if !messageObj.metadata?
+        msg = if message.event == 'comment' then message.content.text else message.content
 
-      @receive messageObj
+        # Reformat leading @mention name to be like "name: message" which is
+        # what hubot expects. Add bot name with private messages if not already given.
+        botPrefix = "#{@robot.name}: "
+        regex = new RegExp("^@#{@bot.userName}(,|\\b)", "i")
+        hubotMsg = msg.replace(regex, botPrefix)
+        if !message.flow && !hubotMsg.match(new RegExp("^#{@robot.name}", "i"))
+          hubotMsg = botPrefix + hubotMsg
+
+        author.room = message.flow # Many scripts expect author.room to be available
+        author.flow = message.flow # For backward compatibility
+
+        metadata =
+          room: message.flow
+        metadata['thread_id'] = thread_id if thread_id?
+        metadata['message_id'] = messageId if messageId?
+
+        messageObj = new TextMessage(author, hubotMsg, message.id, metadata)
+        # Support metadata even if hubot does not currently do that
+        messageObj.metadata = metadata if !messageObj.metadata?
+
+        @receive messageObj
 
   run: ->
     @apiToken      = process.env.HUBOT_FLOWDOCK_API_TOKEN
